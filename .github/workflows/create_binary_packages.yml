@@ -1,0 +1,94 @@
+---
+on: push
+
+env:
+  GENTOO_ROOT_DIRECTORY: mnt/gentoo
+  PORTAGE_PROFILE: default/linux/arm64/23.0/hardened/selinux/systemd
+
+jobs:
+  build:
+    name: Build Fluentoo Image
+    runs-on: self-hosted
+
+    steps:
+      - name: Clean Workspace
+        run: |
+          sudo rm --recursive --force ${{ env.GENTOO_ROOT_DIRECTORY }} || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set CPUS environment variable
+        run: |
+          echo "CPUS=$(nproc --all)" >> ${GITHUB_ENV}
+
+      # TODO: add GPG verification
+      - name: Download stage3 tarball
+        run: |
+          version_line=$(curl --silent https://distfiles.gentoo.org/releases/arm64/autobuilds/latest-stage3-arm64-systemd.txt | grep --extended-regexp "^[[:digit:]]{8}T[[:digit:]]{6}Z")
+          stage3_archive=$(echo ${version_line} | sed --regexp-extended --expression="s [[:digit:]]{8}T[[:digit:]]{6}Z/  g" | sed --regexp-extended --expression="s [[:digit:]]{9,10}$  g")
+          curl https://distfiles.gentoo.org/releases/arm64/autobuilds/current-stage3-arm64-systemd/${stage3_archive} --output stage3.tar.xz
+          
+      - name: Extract stage3 tarball
+        run: |
+          sudo mkdir --parents ${{ env.GENTOO_ROOT_DIRECTORY }}
+          sudo tar --extract --preserve-permissions --xattrs-include='*.*' --numeric-owner --verbose \
+            --file=stage3.tar.xz \
+            --directory=${{ env.GENTOO_ROOT_DIRECTORY }}
+          sudo chown --recursive actions-runner: ${{ env.GENTOO_ROOT_DIRECTORY }}
+
+      - name: Copy created binary Packages
+        run: |
+          cp --recursive --preserve=all --verbose /srv/binpkgs/ mnt/gentoo/var/cache/binpkgs/*
+
+      - name: Create resolv.conf
+        run: |
+          ls -l
+          sudo cp --dereference /etc/resolv.conf ${{ env.GENTOO_ROOT_DIRECTORY }}/etc/resolv.conf
+
+      - name: Mount necessary filesystems
+        run : |
+          sudo mount --types proc /proc ${{ env.GENTOO_ROOT_DIRECTORY }}/proc
+          sudo mount --rbind /sys ${{ env.GENTOO_ROOT_DIRECTORY }}/sys
+          sudo mount --make-rslave ${{ env.GENTOO_ROOT_DIRECTORY }}/sys
+          sudo mount --rbind /dev ${{ env.GENTOO_ROOT_DIRECTORY }}/dev
+          sudo mount --make-rslave ${{ env.GENTOO_ROOT_DIRECTORY }}/dev
+          sudo mount --bind /run ${{ env.GENTOO_ROOT_DIRECTORY }}/run
+          sudo mount --make-slave ${{ env.GENTOO_ROOT_DIRECTORY }}/run 
+
+      - name: Syncing portage tree
+        run: |
+          sudo chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'emerge-webrsync'
+
+      - name: Set Portage profile to ${{ env.PORTAGE_PROFILE }}
+        run: |
+          sudo chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'eselect profile set ${{ env.PORTAGE_PROFILE }}'
+
+      - name: Adapt make.conf
+        run: |
+          sudo cp config/make.conf ${{ env.GENTOO_ROOT_DIRECTORY }}/etc/portage/make.conf
+
+      - name: Rebuild @world set with new Profile and Flags
+        run: |
+          chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'emerge --emptytree --update --newuse --changed-use --deep @world'
+
+      - name: Use systemd stub-resolver
+        run: |
+          sudo chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'rm /etc/resolv.conf'
+          sudo chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'ln --symbolic /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf'
+          sudo chroot ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'ln --symbolic /usr/lib/systemd/system/systemd-resolved.service /etc/systemd/system/sysinit.target.wants/systemd-resolved.service'
+
+      # TODO: check if directory exists
+      - name: Copy packages to be served by binary package host
+        if: always()  
+        run: |
+          cp --recursive --preserve=all --verbose mnt/gentoo/var/cache/binpkgs/* /srv/binpkgs/
+
+      # TODO: check if mounted
+      - name: Unmount necessary filesystems
+        if: always()
+        run : |
+          sudo umount --lazy ${{ env.GENTOO_ROOT_DIRECTORY }}/proc
+          sudo umount --lazy ${{ env.GENTOO_ROOT_DIRECTORY }}/sys
+          sudo umount --lazy ${{ env.GENTOO_ROOT_DIRECTORY }}/dev
+          sudo umount --lazy ${{ env.GENTOO_ROOT_DIRECTORY }}/run
