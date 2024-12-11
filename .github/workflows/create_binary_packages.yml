@@ -1,0 +1,83 @@
+---
+name: Create binary packages
+
+on: push
+
+env:
+  GENTOO_ROOT_DIRECTORY: fluentoo-root
+  PORTAGE_PROFILE: default/linux/arm64/23.0/hardened/selinux/systemd
+
+jobs:
+  build:
+    name: Create binary packages
+    runs-on: [self-hosted, Linux, ARM64]
+
+    steps:
+      - name: Clean Workspace
+        run: |
+          sudo rm --recursive --force ${{ env.GENTOO_ROOT_DIRECTORY }} || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # TODO: add GPG verification
+      - name: Download stage3 tarball
+        run: |
+          version_line=$(curl --silent https://distfiles.gentoo.org/releases/arm64/autobuilds/latest-stage3-arm64-systemd.txt | grep --extended-regexp "^[[:digit:]]{8}T[[:digit:]]{6}Z")
+          stage3_archive=$(echo ${version_line} | sed --regexp-extended --expression="s [[:digit:]]{8}T[[:digit:]]{6}Z/  g" | sed --regexp-extended --expression="s [[:digit:]]{9,10}$  g")
+          curl https://distfiles.gentoo.org/releases/arm64/autobuilds/current-stage3-arm64-systemd/${stage3_archive} --output stage3.tar.xz
+          
+      - name: Extract stage3 tarball
+        run: |
+          sudo mkdir --parents ${{ env.GENTOO_ROOT_DIRECTORY }}
+          sudo tar --extract --preserve-permissions --xattrs-include='*.*' --numeric-owner --verbose \
+            --file=stage3.tar.xz \
+            --directory=${{ env.GENTOO_ROOT_DIRECTORY }}
+
+      - name: Create resolv.conf
+        run: |
+          sudo cp --dereference /etc/resolv.conf ${{ env.GENTOO_ROOT_DIRECTORY }}/etc/resolv.conf
+
+      - name: Mount necessary filesystems
+        run: |
+          sudo mount --types proc /proc ${{ env.GENTOO_ROOT_DIRECTORY }}/proc
+          sudo mount --bind /run ${{ env.GENTOO_ROOT_DIRECTORY }}/run
+          sudo mount --make-slave ${{ env.GENTOO_ROOT_DIRECTORY }}/run 
+          sudo mount --rbind /dev ${{ env.GENTOO_ROOT_DIRECTORY }}/dev
+          sudo mount --make-rslave ${{ env.GENTOO_ROOT_DIRECTORY }}/dev
+          sudo mount --rbind /sys ${{ env.GENTOO_ROOT_DIRECTORY }}/sys
+          sudo mount --make-rslave ${{ env.GENTOO_ROOT_DIRECTORY }}/sys
+
+      - name: Mount binary package filesystem and remove default 'Gentoo binary host'
+        run: |
+          sudo mount --bind /srv/fluentoo/binary_packages ${{ env.GENTOO_ROOT_DIRECTORY }}/var/cache/binpkgs
+          sudo rm ${{ env.GENTOO_ROOT_DIRECTORY }}/etc/portage/binrepos.conf/gentoobinhost.conf
+          sudo chroot --userspec=root:root ${{ env.GENTOO_ROOT_DIRECTORY }} bash -c 'getuto'
+
+      - name: Syncing portage tree
+        run: |
+          sudo chroot --userspec=root:root ${{ env.GENTOO_ROOT_DIRECTORY }} bash -c 'emaint sync --all'
+
+      - name: Set Portage profile to ${{ env.PORTAGE_PROFILE }}
+        run: |
+          sudo chroot --userspec=root:root ${{ env.GENTOO_ROOT_DIRECTORY }} bash -c 'eselect profile set ${{ env.PORTAGE_PROFILE }}'
+
+      - name: Adapt make.conf
+        run: |
+          sudo cp config/make.conf ${{ env.GENTOO_ROOT_DIRECTORY }}/etc/portage/make.conf
+
+      - name: Rebuild @world set with new Profile and Flags
+        run: |
+          sudo chroot --userspec=root:root ${{ env.GENTOO_ROOT_DIRECTORY }} sh -c 'emerge --emptytree --update --newuse --changed-use --deep --quiet-build y @world'
+
+      - name: Unmount necessary filesystems
+        if: always()
+        run : |
+          for dir in proc sys dev run; do
+            if mountpoint --quiet "${{ env.GENTOO_ROOT_DIRECTORY }}/${dir}"; then
+              echo "Unmounting ${{ env.GENTOO_ROOT_DIRECTORY }}/${dir}"
+              sudo umount --lazy "${{ env.GENTOO_ROOT_DIRECTORY }}/${dir}"
+            fi
+          done
+          
+          sudo umount "${{ env.GENTOO_ROOT_DIRECTORY }}/var/cache/binpkgs"
